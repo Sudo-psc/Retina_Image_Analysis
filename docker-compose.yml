@@ -1,0 +1,134 @@
+version: '3.8'
+
+services:
+  # Main application service
+  app:
+    build:
+      context: .
+      target: development
+    ports:
+      - "8000:8000"  # API
+      - "8888:8888"  # Jupyter
+    volumes:
+      - .:/app
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./logs:/app/logs
+    environment:
+      - ENVIRONMENT=development
+      - PYTHONPATH=/app
+    env_file:
+      - .env
+    depends_on:
+      - mlflow
+      - postgres
+    networks:
+      - retina-net
+
+  # MLflow tracking server
+  mlflow:
+    image: python:3.9-slim
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./mlruns:/mlruns
+      - ./mlflow.db:/mlflow.db
+    environment:
+      - MLFLOW_BACKEND_STORE_URI=sqlite:///mlflow.db
+      - MLFLOW_DEFAULT_ARTIFACT_ROOT=/mlruns
+    command: >
+      bash -c "pip install mlflow psycopg2-binary &&
+               mlflow server
+               --backend-store-uri sqlite:///mlflow.db
+               --default-artifact-root /mlruns
+               --host 0.0.0.0
+               --port 5000"
+    networks:
+      - retina-net
+
+  # PostgreSQL database for metadata
+  postgres:
+    image: postgres:13
+    environment:
+      - POSTGRES_DB=retina_analysis
+      - POSTGRES_USER=retina_user
+      - POSTGRES_PASSWORD=retina_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - retina-net
+
+  # Redis for caching
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - retina-net
+
+  # Nginx for load balancing (production)
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deployment/nginx.conf:/etc/nginx/nginx.conf
+      - ./deployment/ssl:/etc/nginx/ssl
+    depends_on:
+      - app
+    networks:
+      - retina-net
+    profiles:
+      - production
+
+  # Monitoring with Prometheus
+  prometheus:
+    image: prom/prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deployment/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    networks:
+      - retina-net
+    profiles:
+      - monitoring
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./deployment/grafana:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+    networks:
+      - retina-net
+    profiles:
+      - monitoring
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  retina-net:
+    driver: bridge
