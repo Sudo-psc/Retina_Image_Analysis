@@ -5,9 +5,10 @@ This module provides PyTorch Dataset classes for loading and preprocessing
 retinal images for machine learning tasks.
 """
 
-import os
+import logging
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from functools import lru_cache
 
 import cv2
 import numpy as np
@@ -16,6 +17,21 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
+
+logger = logging.getLogger(__name__)
+
+# Constants
+DEFAULT_IMAGE_SIZE = (512, 512)
+IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".tiff", ".bmp", ".tif"})
+DEFAULT_TRANSFORM_PARAMS = {
+    "mean": [0.485, 0.456, 0.406],
+    "std": [0.229, 0.224, 0.225],
+    "brightness": 0.2,
+    "contrast": 0.2,
+    "saturation": 0.2,
+    "hue": 0.1,
+    "rotation_degrees": 15
+}
 
 
 class RetinaDataset(Dataset):
@@ -35,7 +51,7 @@ class RetinaDataset(Dataset):
         annotations_file: Optional[Union[str, Path]] = None,
         transform: Optional[Callable] = None,
         target_transform: Optional[Callable] = None,
-        image_size: Tuple[int, int] = (512, 512),
+        image_size: Tuple[int, int] = DEFAULT_IMAGE_SIZE,
         mode: str = "train",
         dataset_type: str = "classification",
     ) -> None:
@@ -60,11 +76,17 @@ class RetinaDataset(Dataset):
         self.dataset_type = dataset_type
 
         # Load annotations if provided
-        if annotations_file and os.path.exists(annotations_file):
-            self.annotations = pd.read_csv(annotations_file)
+        if annotations_file and Path(annotations_file).exists():
+            try:
+                self.annotations = pd.read_csv(annotations_file)
+                logger.info(f"Loaded {len(self.annotations)} annotations from {annotations_file}")
+            except Exception as e:
+                logger.error(f"Failed to load annotations from {annotations_file}: {e}")
+                raise
         else:
             # If no annotations file, create from directory structure
             self.annotations = self._create_annotations_from_directory()
+            logger.info(f"Created {len(self.annotations)} annotations from directory structure")
 
         # Filter annotations by mode if split column exists
         if "split" in self.annotations.columns:
@@ -78,10 +100,14 @@ class RetinaDataset(Dataset):
 
     def _create_annotations_from_directory(self) -> pd.DataFrame:
         """Create annotations DataFrame from directory structure."""
-        image_extensions = {".jpg", ".jpeg", ".png", ".tiff", ".bmp"}
+        # Use predefined image extensions
+        image_extensions: Set[str] = IMAGE_EXTENSIONS
 
         images = []
         labels = []
+
+        if not self.data_dir.exists():
+            raise FileNotFoundError(f"Data directory does not exist: {self.data_dir}")
 
         # If directory has subdirectories (class-based organization)
         subdirs = [d for d in self.data_dir.iterdir() if d.is_dir()]
@@ -90,16 +116,29 @@ class RetinaDataset(Dataset):
             # Class-based directory structure
             for class_dir in subdirs:
                 class_name = class_dir.name
-                for img_path in class_dir.iterdir():
-                    if img_path.suffix.lower() in image_extensions:
-                        images.append(str(img_path.relative_to(self.data_dir)))
-                        labels.append(class_name)
+                class_images = [
+                    img_path for img_path in class_dir.iterdir()
+                    if img_path.suffix.lower() in image_extensions
+                ]
+                
+                for img_path in class_images:
+                    images.append(str(img_path.relative_to(self.data_dir)))
+                    labels.append(class_name)
+                
+                logger.debug(f"Found {len(class_images)} images in class '{class_name}'")
         else:
             # Flat directory structure
-            for img_path in self.data_dir.iterdir():
-                if img_path.suffix.lower() in image_extensions:
-                    images.append(str(img_path.relative_to(self.data_dir)))
-                    labels.append(0)  # Default label
+            flat_images = [
+                img_path for img_path in self.data_dir.iterdir()
+                if img_path.suffix.lower() in image_extensions
+            ]
+            
+            for img_path in flat_images:
+                images.append(str(img_path.relative_to(self.data_dir)))
+                labels.append("unknown")  # More descriptive default label
+
+        if not images:
+            raise ValueError(f"No valid images found in {self.data_dir}")
 
         return pd.DataFrame({"image_path": images, "label": labels})
 
@@ -110,13 +149,17 @@ class RetinaDataset(Dataset):
                 [
                     transforms.Resize(self.image_size),
                     transforms.RandomHorizontalFlip(p=0.5),
-                    transforms.RandomRotation(degrees=15),
+                    transforms.RandomRotation(degrees=DEFAULT_TRANSFORM_PARAMS["rotation_degrees"]),
                     transforms.ColorJitter(
-                        brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1
+                        brightness=DEFAULT_TRANSFORM_PARAMS["brightness"], 
+                        contrast=DEFAULT_TRANSFORM_PARAMS["contrast"], 
+                        saturation=DEFAULT_TRANSFORM_PARAMS["saturation"], 
+                        hue=DEFAULT_TRANSFORM_PARAMS["hue"]
                     ),
                     transforms.ToTensor(),
                     transforms.Normalize(
-                        mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+                        mean=DEFAULT_TRANSFORM_PARAMS["mean"], 
+                        std=DEFAULT_TRANSFORM_PARAMS["std"]
                     ),
                 ]
             )
@@ -126,7 +169,8 @@ class RetinaDataset(Dataset):
                     transforms.Resize(self.image_size),
                     transforms.ToTensor(),
                     transforms.Normalize(
-                        mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+                        mean=DEFAULT_TRANSFORM_PARAMS["mean"], 
+                        std=DEFAULT_TRANSFORM_PARAMS["std"]
                     ),
                 ]
             )
@@ -152,11 +196,20 @@ class RetinaDataset(Dataset):
         row = self.annotations.iloc[idx]
         img_path = self.data_dir / row["image_path"]
 
-        # Load image
+        # Load image with validation
         try:
+            if not img_path.exists():
+                raise FileNotFoundError(f"Image file not found: {img_path}")
+            
             image = Image.open(img_path).convert("RGB")
+            
+            # Validate image
+            if image.size[0] == 0 or image.size[1] == 0:
+                raise ValueError(f"Invalid image dimensions: {image.size}")
+                
         except Exception as e:
-            raise RuntimeError(f"Error loading image {img_path}: {e}")
+            logger.error(f"Error loading image {img_path}: {e}")
+            raise RuntimeError(f"Error loading image {img_path}: {e}") from e
 
         # Get label
         label = row["label"]
@@ -186,38 +239,42 @@ class RetinaDataset(Dataset):
 
         return sample
 
+    @lru_cache(maxsize=None)
+    def _get_label_encoder(self) -> Dict[str, int]:
+        """Get or create label encoder mapping."""
+        unique_labels = self.annotations["label"].unique()
+        return {label: idx for idx, label in enumerate(sorted(unique_labels))}
+        
     def _encode_label(self, label: str) -> int:
         """Encode string label to integer."""
-        if not hasattr(self, "label_encoder"):
-            unique_labels = self.annotations["label"].unique()
-            self.label_encoder = {
-                label: idx for idx, label in enumerate(sorted(unique_labels))
-            }
-
-        return self.label_encoder[label]
+        if not hasattr(self, "_label_encoder_cache"):
+            self._label_encoder_cache = self._get_label_encoder()
+        return self._label_encoder_cache[label]
 
     def get_class_weights(self) -> torch.Tensor:
-        """Calculate class weights for imbalanced datasets."""
-        if "label" not in self.annotations.columns:
+        """Calculate class weights for imbalanced datasets using sklearn-like formula."""
+        if "label" not in self.annotations.columns or len(self.annotations) == 0:
             return torch.ones(1)
 
         # Convert string labels to numeric
         labels = self.annotations["label"].values
-        if isinstance(labels[0], str):
+        if len(labels) > 0 and isinstance(labels[0], str):
             labels = [self._encode_label(label) for label in labels]
 
         # Calculate class frequencies
         unique_labels, counts = np.unique(labels, return_counts=True)
         total_samples = len(labels)
+        n_classes = len(unique_labels)
 
-        # Calculate weights (inverse frequency)
-        weights = total_samples / (len(unique_labels) * counts)
+        # Calculate balanced weights (sklearn formula)
+        weights = total_samples / (n_classes * counts)
 
         # Create tensor with weights for all classes
-        class_weights = torch.zeros(len(unique_labels))
+        class_weights = torch.zeros(n_classes, dtype=torch.float32)
         for i, label in enumerate(unique_labels):
             class_weights[label] = weights[i]
 
+        logger.info(f"Calculated class weights for {n_classes} classes: {class_weights.tolist()}")
         return class_weights
 
     def get_dataset_stats(self) -> Dict[str, Any]:
@@ -247,15 +304,17 @@ class MultiTaskRetinaDataset(RetinaDataset):
     - Vessel segmentation
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
-        # Identify task columns
+        # Identify task columns (excluding metadata columns)
+        excluded_columns = {"image_path", "split", "index", "label"}
         self.task_columns = [
-            col
-            for col in self.annotations.columns
-            if col not in ["image_path", "split", "index"]
+            col for col in self.annotations.columns
+            if col not in excluded_columns
         ]
+        
+        logger.info(f"Initialized MultiTaskRetinaDataset with {len(self.task_columns)} task columns: {self.task_columns}")
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """Get sample with multiple tasks."""
@@ -276,13 +335,15 @@ class MultiTaskRetinaDataset(RetinaDataset):
         return sample
 
     def _encode_task_label(self, task: str, label: str) -> int:
-        """Encode task-specific labels."""
-        encoder_attr = f"{task}_encoder"
-
-        if not hasattr(self, encoder_attr):
+        """Encode task-specific labels with caching."""
+        if not hasattr(self, "_task_encoders"):
+            self._task_encoders = {}
+            
+        if task not in self._task_encoders:
             unique_labels = self.annotations[task].unique()
-            encoder = {label: idx for idx, label in enumerate(sorted(unique_labels))}
-            setattr(self, encoder_attr, encoder)
+            self._task_encoders[task] = {
+                label: idx for idx, label in enumerate(sorted(unique_labels))
+            }
+            logger.debug(f"Created encoder for task '{task}' with {len(unique_labels)} classes")
 
-        encoder = getattr(self, encoder_attr)
-        return encoder[label]
+        return self._task_encoders[task][label]

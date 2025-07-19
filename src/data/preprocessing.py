@@ -5,12 +5,25 @@ This module provides functions for preprocessing retinal images including
 normalization, enhancement, and quality assessment.
 """
 
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+from functools import lru_cache
 
 import cv2
 import numpy as np
-from PIL import Image, ImageEnhance
+from PIL import Image
+
+logger = logging.getLogger(__name__)
+
+# Constants for preprocessing
+DEFAULT_TARGET_SIZE = (512, 512)
+DEFAULT_CLAHE_PARAMS = {"clipLimit": 2.0, "tileGridSize": (8, 8)}
+DEFAULT_BLUR_KERNEL = (3, 3)
+DEFAULT_MEDIAN_KERNEL_SIZE = 3
+DEFAULT_GAUSSIAN_SIGMA = 0.5
+DEFAULT_MORPH_KERNEL_SIZE = (3, 3)
+OPTIC_DISC_BLUR_KERNEL = (21, 21)
 
 
 class ImagePreprocessor:
@@ -23,7 +36,7 @@ class ImagePreprocessor:
 
     def __init__(
         self,
-        target_size: Tuple[int, int] = (512, 512),
+        target_size: Tuple[int, int] = DEFAULT_TARGET_SIZE,
         normalize: bool = True,
         enhance_contrast: bool = True,
         remove_artifacts: bool = True,
@@ -36,11 +49,19 @@ class ImagePreprocessor:
             normalize: Whether to normalize pixel values
             enhance_contrast: Whether to enhance image contrast
             remove_artifacts: Whether to remove imaging artifacts
+            
+        Raises:
+            ValueError: If target_size contains non-positive values
         """
+        if target_size[0] <= 0 or target_size[1] <= 0:
+            raise ValueError(f"Target size must be positive: {target_size}")
+            
         self.target_size = target_size
         self.normalize = normalize
         self.enhance_contrast = enhance_contrast
         self.remove_artifacts = remove_artifacts
+        
+        logger.info(f"Initialized ImagePreprocessor with target_size={target_size}")
 
     def preprocess(
         self,
@@ -57,15 +78,22 @@ class ImagePreprocessor:
         Returns:
             Dictionary containing processed image and metadata
         """
-        # Load image if path provided
+        # Load and validate image
         if isinstance(image, (str, Path)):
             image = self.load_image(image)
         elif isinstance(image, Image.Image):
             image = np.array(image)
+        elif not isinstance(image, np.ndarray):
+            raise TypeError(f"Unsupported image type: {type(image)}")
+
+        # Validate image dimensions
+        if len(image.shape) not in [2, 3]:
+            raise ValueError(f"Invalid image shape: {image.shape}")
+        
+        if len(image.shape) == 3 and image.shape[2] not in [1, 3, 4]:
+            raise ValueError(f"Invalid number of channels: {image.shape[2]}")
 
         original_shape = image.shape
-
-        # Store original for comparison
         original_image = image.copy()
 
         # Preprocessing steps
@@ -168,9 +196,14 @@ class ImagePreprocessor:
 
         return metrics
 
+    @lru_cache(maxsize=1)
+    def _get_morphology_kernel(self) -> np.ndarray:
+        """Get cached morphology kernel."""
+        return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, DEFAULT_MORPH_KERNEL_SIZE)
+        
     def remove_artifacts_func(self, image: np.ndarray) -> np.ndarray:
         """
-        Remove common imaging artifacts from retinal images.
+        Remove common imaging artifacts from retinal images efficiently.
 
         Args:
             image: Input image
@@ -179,20 +212,25 @@ class ImagePreprocessor:
             Image with artifacts removed
         """
         # Median filtering to remove salt-and-pepper noise
-        denoised = cv2.medianBlur(image, 3)
+        denoised = cv2.medianBlur(image, DEFAULT_MEDIAN_KERNEL_SIZE)
 
-        # Gaussian blur to reduce high-frequency noise
-        denoised = cv2.GaussianBlur(denoised, (3, 3), 0.5)
+        # Gaussian blur to reduce high-frequency noise  
+        denoised = cv2.GaussianBlur(denoised, DEFAULT_BLUR_KERNEL, DEFAULT_GAUSSIAN_SIGMA)
 
-        # Morphological opening to remove small artifacts
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        # Morphological opening to remove small artifacts using cached kernel
+        kernel = self._get_morphology_kernel()
         denoised = cv2.morphologyEx(denoised, cv2.MORPH_OPEN, kernel)
 
         return denoised
 
+    @lru_cache(maxsize=1)
+    def _get_clahe_processor(self) -> cv2.CLAHE:
+        """Get cached CLAHE processor."""
+        return cv2.createCLAHE(**DEFAULT_CLAHE_PARAMS)
+        
     def enhance_contrast_func(self, image: np.ndarray) -> np.ndarray:
         """
-        Enhance image contrast using CLAHE.
+        Enhanced image contrast using CLAHE with caching.
 
         Args:
             image: Input image
@@ -200,11 +238,11 @@ class ImagePreprocessor:
         Returns:
             Contrast-enhanced image
         """
-        # Convert to LAB color space
+        # Convert to LAB color space for better contrast enhancement
         lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
 
-        # Apply CLAHE to L channel
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        # Apply CLAHE to L channel using cached processor
+        clahe = self._get_clahe_processor()
         lab[:, :, 0] = clahe.apply(lab[:, :, 0])
 
         # Convert back to RGB
@@ -333,7 +371,7 @@ class ImagePreprocessor:
         enhanced = cv2.equalizeHist(gray)
 
         # Apply Gaussian blur
-        blurred = cv2.GaussianBlur(enhanced, (21, 21), 0)
+        blurred = cv2.GaussianBlur(enhanced, OPTIC_DISC_BLUR_KERNEL, 0)
 
         # Threshold to find bright regions
         _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -359,7 +397,7 @@ class ImagePreprocessor:
         self,
         image_paths: List[Union[str, Path]],
         output_dir: Optional[Union[str, Path]] = None,
-        save_metadata: bool = True,
+        save_metadata: bool = True,  # Currently unused but kept for future extensibility
     ) -> List[Dict[str, Any]]:
         """
         Preprocess a batch of images.
@@ -399,7 +437,12 @@ class ImagePreprocessor:
                 results.append(result)
 
             except Exception as e:
-                print(f"Error processing {image_path}: {e}")
-                results.append({"input_path": str(image_path), "error": str(e)})
+                error_msg = f"Error processing {image_path}: {e}"
+                logger.error(error_msg)
+                results.append({
+                    "input_path": str(image_path), 
+                    "batch_index": i,
+                    "error": str(e)
+                })
 
         return results

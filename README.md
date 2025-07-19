@@ -38,10 +38,10 @@
 
 #### Phase 2: Data Management / Fase 2: Gestão de Dados
 
-- [ ] Dataset collection and curation / Coleta e curadoria de datasets
-- [ ] Data preprocessing pipeline / Pipeline de pré-processamento de dados
-- [ ] Data augmentation strategies / Estratégias de aumento de dados
-- [ ] Data validation and quality control / Validação e controle de qualidade dos dados
+- [x] Dataset collection and curation / Coleta e curadoria de datasets
+- [x] Data preprocessing pipeline / Pipeline de pré-processamento de dados
+- [x] Data augmentation strategies / Estratégias de aumento de dados
+- [x] Data validation and quality control / Validação e controle de qualidade dos dados
 
 #### Phase 3: Model Development / Fase 3: Desenvolvimento do Modelo
 

@@ -114,7 +114,7 @@ class TestImagePreprocessor:
         expected_keys = ["sharpness", "contrast", "brightness", "snr", "dynamic_range"]
         for key in expected_keys:
             assert key in metrics
-            assert isinstance(metrics[key], (int, float))
+            assert isinstance(metrics[key], (int, float, np.integer, np.floating))
 
     def test_resize_image(self):
         """Test image resizing functionality."""
